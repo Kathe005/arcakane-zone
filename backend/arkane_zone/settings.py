@@ -1,12 +1,49 @@
 from pathlib import Path
+
 import environ
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 env = environ.Env(DEBUG=(bool, False))
 environ.Env.read_env(BASE_DIR / ".env")
 
-SECRET_KEY = env("SECRET_KEY")
+
+def _validar_secret_key(valor: str, debug: bool) -> str:
+    """Rechaza claves vacías o de ejemplo antes de arrancar en producción."""
+    clave = (valor or "").strip()
+    if not clave:
+        raise ImproperlyConfigured(
+            "SECRET_KEY está vacía. Genera una clave real con: openssl rand -hex 32"
+        )
+
+    # La suite usa settings_test.py con claves cortas a propósito; el módulo
+    # de producción sí exige una clave con entropía suficiente para `check --deploy`.
+    es_test = env("DJANGO_SETTINGS_MODULE", default="").endswith("settings_test")
+    if debug or es_test:
+        return clave
+
+    ejemplos = {
+        "cambia-esto-por-una-clave-larga-y-aleatoria",
+        "replace-with-a-long-random-secret-key",
+        "test-key",
+        "secret",
+        "changeme",
+    }
+    if (
+        clave in ejemplos
+        or clave.startswith("django-insecure-")
+        or len(clave) < 50
+        or len(set(clave)) < 5
+    ):
+        raise ImproperlyConfigured(
+            "SECRET_KEY es de ejemplo o demasiado débil para producción. "
+            "Genera una clave real con: openssl rand -hex 32"
+        )
+    return clave
+
+
+SECRET_KEY = _validar_secret_key(env("SECRET_KEY", default=""), env("DEBUG"))
 DEBUG = env("DEBUG")
 ALLOWED_HOSTS = env.list("ALLOWED_HOSTS", default=["localhost", "127.0.0.1", "backend"])
 
@@ -34,6 +71,7 @@ INSTALLED_APPS = [
     # Apps del proyecto
     "cuentas",
     "catalogo",
+    "inventario",
     "pedidos",
     "pagos",
     "reportes",
@@ -41,6 +79,9 @@ INSTALLED_APPS = [
 ]
 
 MIDDLEWARE = [
+    # Debe ir primero: cubre también a SecurityMiddleware y garantiza que
+    # todo log de la API tenga un request_id y toda respuesta lo devuelva.
+    "api.middleware.RequestIdMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",  # debe ir justo después de SecurityMiddleware
     # CORS debe ejecutarse antes de CommonMiddleware.
@@ -172,12 +213,59 @@ CSRF_TRUSTED_ORIGINS = env.list(
 if RENDER_EXTERNAL_HOSTNAME:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RENDER_EXTERNAL_HOSTNAME}")
 
+# ── Caché compartida y protección contra fuerza bruta ────────────────────────
+# Por defecto los contadores de throttling viven en una tabla de PostgreSQL,
+# creada por `manage.py createcachetable` (no requiere migraciones). Con
+# REDIS_URL se usa Redis; el paquete `redis` debe estar instalado en el entorno.
+def tasa_desde_entorno(nombre: str, defecto: str) -> str | None:
+    """Lee una tasa DRF; una cadena vacía desactiva el scope indicado."""
+    valor = env(f"THROTTLE_RATE_{nombre}", default=defecto)
+    return str(valor).strip() or None
+
+
+CACHE_TABLE = env("CACHE_TABLE", default="django_cache")
+REDIS_URL = env("REDIS_URL", default=None)
+if REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.db.DatabaseCache",
+            "LOCATION": CACHE_TABLE,
+        }
+    }
+
+# 0 = confiar solo en REMOTE_ADDR; > 0 = leer X-Forwarded-For desde la derecha.
+THROTTLE_NUM_PROXIES = max(0, env.int("THROTTLE_NUM_PROXIES", default=0))
+LOGIN_MAX_FAILED_ATTEMPTS = max(1, env.int("LOGIN_MAX_FAILED_ATTEMPTS", default=5))
+LOGIN_FAILURE_WINDOW_SECONDS = max(1, env.int("LOGIN_FAILURE_WINDOW_SECONDS", default=900))
+LOGIN_LOCKOUT_SECONDS = max(1, env.int("LOGIN_LOCKOUT_SECONDS", default=900))
+
+# Tope de unidades por línea del carrito. Se valida en la API y en el servicio
+# para que la regla sea la misma en REST y en las vistas HTML.
+CARRITO_MAX_CANTIDAD_POR_LINEA = max(
+    1, env.int("CARRITO_MAX_CANTIDAD_POR_LINEA", default=20)
+)
+
 # ── API REST ─────────────────────────────────────────────────────────────────
-# Autenticación por token (clientes desacoplados) y por sesión/cookie
+# Autenticación por token propio (clientes desacoplados) y por sesión/cookie
 # (misma sesión que usa el sitio y el admin de Django).
+def ttl_token_desde_entorno() -> int:
+    """Días de vigencia de los tokens de API; mínimo 1 día."""
+    return max(1, env.int("API_TOKEN_TTL_DAYS", default=7))
+
+
+API_TOKEN_TTL_DAYS = ttl_token_desde_entorno()
+
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.TokenAuthentication",
+        # Primero: un token inválido/vencido debe dar 401, no 403.
+        "api.authentication.ApiTokenAuthentication",
         "rest_framework.authentication.SessionAuthentication",
     ],
     # Por defecto todo exige autenticación; cada vista pública lo declara.
@@ -190,6 +278,19 @@ REST_FRAMEWORK = {
     "DEFAULT_PAGINATION_CLASS": "api.pagination.StandardResultsSetPagination",
     "PAGE_SIZE": 20,
     "EXCEPTION_HANDLER": "api.exceptions.api_exception_handler",
+    # Throttling: globales anon/user + scopes específicos de las rutas sensibles.
+    "DEFAULT_THROTTLE_CLASSES": [
+        "api.throttling.AnonimoRateThrottle",
+        "api.throttling.UsuarioRateThrottle",
+    ],
+    "DEFAULT_THROTTLE_RATES": {
+        "anon": tasa_desde_entorno("ANON", "100/min"),
+        "user": tasa_desde_entorno("USER", "1000/hour"),
+        "login": tasa_desde_entorno("LOGIN", "10/min"),
+        "registro": tasa_desde_entorno("REGISTRO", "5/hour"),
+        "contacto": tasa_desde_entorno("CONTACTO", "5/hour"),
+    },
+    "NUM_PROXIES": THROTTLE_NUM_PROXIES,
     # Respuestas JSON legibles (tildes y eñes sin escapes).
     "UNICODE_JSON": True,
     "COMPACT_JSON": False,
@@ -215,15 +316,72 @@ CORS_ALLOW_CREDENTIALS = True
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 USE_X_FORWARDED_HOST = env.bool("USE_X_FORWARDED_HOST", default=False)
 
-# Seguridad adicional en producción (no aplica en local con DEBUG=True).
-# En Docker el healthcheck interno viaja por HTTP, por eso SECURE_SSL_REDIRECT
-# se puede desactivar dentro del contenedor cuando TLS termina en el proxy.
-if not DEBUG:
-    SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=True)
-    SESSION_COOKIE_SECURE = True
-    CSRF_COOKIE_SECURE = True
-    SECURE_HSTS_SECONDS = 31536000
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+# ── Endurecimiento HTTP y cookies ────────────────────────────────────────────
+# Detrás del proxy, Nginx/Render envían X-Forwarded-Proto: https, por lo que
+# SECURE_SSL_REDIRECT puede permanecer activo sin romper el tráfico legítimo.
+# El healthcheck interno envía esa misma cabecera (ver compose.yaml).
+# En desarrollo (`DEBUG=True`) se desactiva para no romper el runserver local.
+SECURE_SSL_REDIRECT = env.bool("SECURE_SSL_REDIRECT", default=not DEBUG)
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = env("SESSION_COOKIE_SAMESITE", default="Lax")
+CSRF_COOKIE_SAMESITE = env("CSRF_COOKIE_SAMESITE", default="Lax")
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = env("SECURE_REFERRER_POLICY", default="same-origin")
+X_FRAME_OPTIONS = "DENY"
+
+SECURE_HSTS_SECONDS = env.int("SECURE_HSTS_SECONDS", default=31536000)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool(
+    "SECURE_HSTS_INCLUDE_SUBDOMAINS", default=True
+)
+# `preload` solo debe enviarse cuando se piensa someter el dominio a la lista
+# de precarga de HSTS. Se puede desactivar con SECURE_HSTS_PRELOAD=False.
+SECURE_HSTS_PRELOAD = env.bool("SECURE_HSTS_PRELOAD", default=True)
+
+# ── Observabilidad (AZ-S2-BE-09) ─────────────────────────────────────────────
+# `LOG_LEVEL=DEBUG` en desarrollo; en producción se emite consola JSON por
+# stdout para que la plataforma (Docker/Render) lo recolecte sin archivos.
+LOG_LEVEL = env("LOG_LEVEL", default="INFO").upper()
+if LOG_LEVEL not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG", "NOTSET"}:
+    LOG_LEVEL = "INFO"
+
+_FORMATTER = "json" if not DEBUG else "texto"
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "filters": {
+        "request_context": {"()": "api.observabilidad.RequestContextFilter"},
+    },
+    "formatters": {
+        "json": {"()": "api.observabilidad.JsonFormatter"},
+        "texto": {"()": "api.observabilidad.TextoFormatter"},
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stdout",
+            "level": LOG_LEVEL,
+            "formatter": _FORMATTER,
+            "filters": ["request_context"],
+        }
+    },
+    "root": {"handlers": ["console"], "level": LOG_LEVEL},
+    "loggers": {
+        "django": {
+            "handlers": ["console"],
+            "level": "INFO",
+            "filters": ["request_context"],
+            "propagate": False,
+        },
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "filters": ["request_context"],
+            "propagate": False,
+        },
+    },
+}
 
 # django-unfold — paleta azul eléctrico (valores en RGB sin #)
 UNFOLD = {

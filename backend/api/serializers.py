@@ -4,7 +4,11 @@ Los serializadores concentran la validación de entrada. Las reglas de negocio
 que ya existen en ``pedidos.services`` y ``pagos.services`` se reutilizan tal
 cual para no duplicar comportamiento entre las vistas HTML y la API.
 """
+import re
+
+from django.conf import settings
 from django.contrib.auth import password_validation
+from django.core.exceptions import ObjectDoesNotExist, ValidationError as DjangoValidationError
 from django.db import transaction
 from rest_framework import serializers
 
@@ -14,11 +18,84 @@ from catalogo.models import (
     OfertaVideojuego,
     Plataforma,
     Videojuego,
+    VideojuegoCategoria,
+    VideojuegoGenero,
 )
-from cuentas.models import Rol, Usuario
-from pagos.models import Pago, Venta
-from pedidos.models import DetallePedido, Pedido
+from cuentas.models import AuditoriaCuenta, Rol, Usuario
+from inventario.models import MotivoMovimientoInventario, MovimientoInventarioOfertaVideojuego
+from pagos.models import IntentoPago, Venta
+from pedidos.models import DetallePedido, EstadoPedido, Pedido
+from pedidos.services import motivo_indisponibilidad
 from soporte.models import Contacto
+
+
+def _ordenados_por_nombre(gestor):
+    """Ordena en Python para reutilizar el ``prefetch_related`` del viewset."""
+    return sorted(gestor.all(), key=lambda objeto: objeto.nombre)
+
+
+def _primero_por_nombre(gestor):
+    objetos = _ordenados_por_nombre(gestor)
+    return objetos[0] if objetos else None
+
+
+def codigos_estado_pedido():
+    """Códigos vigentes del catálogo de estados (mismo texto del contrato v1)."""
+    return list(EstadoPedido.objects.values_list("codigo", flat=True))
+
+
+class _PrimerRelacionadoField(serializers.Field):
+    """Campo de compatibilidad: un único id, el primero por nombre.
+
+    Sigue aceptando y devolviendo la forma histórica de ``categoria``,
+    ``genero`` y ``rol`` aunque el modelo normalize la relación como M2M.
+    """
+
+    def __init__(self, queryset, related_name, **kwargs):
+        self.queryset = queryset
+        self.related_name = related_name
+        super().__init__(**kwargs)
+
+    def get_attribute(self, instance):
+        return instance
+
+    def to_representation(self, instance):
+        primero = _primero_por_nombre(getattr(instance, self.related_name))
+        return primero.pk if primero is not None else None
+
+    def to_internal_value(self, data):
+        try:
+            return self.queryset.get(pk=data)
+        except (TypeError, ValueError, ObjectDoesNotExist) as exc:
+            raise serializers.ValidationError("Valor inválido.") from exc
+
+
+class _RelacionadosField(serializers.Field):
+    """Lista aditiva de ids, ordenada por nombre de forma determinista."""
+
+    def __init__(self, queryset, related_name, **kwargs):
+        self.queryset = queryset
+        self.related_name = related_name
+        super().__init__(**kwargs)
+
+    def get_attribute(self, instance):
+        return instance
+
+    def to_representation(self, instance):
+        return [objeto.pk for objeto in _ordenados_por_nombre(getattr(instance, self.related_name))]
+
+    def to_internal_value(self, data):
+        if not isinstance(data, (list, tuple)):
+            raise serializers.ValidationError("Se espera una lista de identificadores.")
+        objetos = []
+        for valor in data:
+            try:
+                objeto = self.queryset.get(pk=valor)
+            except (TypeError, ValueError, ObjectDoesNotExist) as exc:
+                raise serializers.ValidationError("Valor inválido.") from exc
+            if objeto not in objetos:
+                objetos.append(objeto)
+        return objetos
 
 
 # ── Catálogo ─────────────────────────────────────────────────────────────────
@@ -140,9 +217,23 @@ class OfertaVideojuegoSerializer(serializers.ModelSerializer):
 
 
 class VideojuegoSerializer(serializers.ModelSerializer):
-    categoria_nombre = serializers.CharField(source="categoria.nombre", read_only=True)
-    genero_nombre = serializers.CharField(source="genero.nombre", read_only=True)
-    disponible = serializers.BooleanField(read_only=True)
+    # ``categoria``/``genero`` se conservan por compatibilidad; las listas
+    # ``categorias``/``generos`` son la forma normalizada del contrato.
+    categoria = _PrimerRelacionadoField(
+        queryset=Categoria.objects, related_name="categorias", required=False
+    )
+    categoria_nombre = serializers.SerializerMethodField()
+    categorias = _RelacionadosField(
+        queryset=Categoria.objects, related_name="categorias", required=False
+    )
+    genero = _PrimerRelacionadoField(
+        queryset=Genero.objects, related_name="generos", required=False
+    )
+    genero_nombre = serializers.SerializerMethodField()
+    generos = _RelacionadosField(
+        queryset=Genero.objects, related_name="generos", required=False
+    )
+    disponible = serializers.SerializerMethodField()
     ofertas = OfertaResumenSerializer(many=True, read_only=True)
 
     class Meta:
@@ -150,13 +241,17 @@ class VideojuegoSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "titulo",
+            "desarrollador",
             "descripcion",
             "portada",
+            "imagen_url",
             "fecha_lanzamiento",
             "categoria",
             "categoria_nombre",
+            "categorias",
             "genero",
             "genero_nombre",
+            "generos",
             "activo",
             "disponible",
             "ofertas",
@@ -168,10 +263,94 @@ class VideojuegoSerializer(serializers.ModelSerializer):
     def validate_titulo(self, value):
         return value.strip()
 
+    def to_internal_value(self, data):
+        # Los errores de campo (p. ej. título vacío) impiden llegar a
+        # ``validate``; se añaden aquí para no perder los errores históricos
+        # de ``categoria``/``genero`` en la respuesta 400.
+        try:
+            return super().to_internal_value(data)
+        except serializers.ValidationError as exc:
+            detalles = exc.detail
+            if self.instance is None and isinstance(detalles, dict):
+                if not data.get("categoria") and not data.get("categorias"):
+                    detalles.setdefault("categoria", ["Este campo es obligatorio."])
+                if not data.get("genero") and not data.get("generos"):
+                    detalles.setdefault("genero", ["Este campo es obligatorio."])
+            raise
+
+    def validate(self, attrs):
+        if self.instance is None:
+            errores = {}
+            if not attrs.get("categoria") and not attrs.get("categorias"):
+                errores["categoria"] = ["Este campo es obligatorio."]
+            if not attrs.get("genero") and not attrs.get("generos"):
+                errores["genero"] = ["Este campo es obligatorio."]
+            if errores:
+                raise serializers.ValidationError(errores)
+
+        categoria = attrs.pop("categoria", None)
+        if categoria is not None and not attrs.get("categorias"):
+            attrs["categorias"] = [categoria]
+        genero = attrs.pop("genero", None)
+        if genero is not None and not attrs.get("generos"):
+            attrs["generos"] = [genero]
+        return attrs
+
+    def get_categoria_nombre(self, obj):
+        primero = _primero_por_nombre(obj.categorias)
+        return primero.nombre if primero is not None else None
+
+    def get_genero_nombre(self, obj):
+        primero = _primero_por_nombre(obj.generos)
+        return primero.nombre if primero is not None else None
+
+    def get_disponible(self, obj):
+        # Calculado sobre las ofertas precargadas para evitar una consulta por
+        # videojuego al serializar el listado.
+        return any(oferta.disponible for oferta in obj.ofertas.all())
+
+    @staticmethod
+    def _sincronizar(modelo, campo, instancia, valores):
+        if valores is None:
+            return
+        modelo.objects.filter(videojuego=instancia).exclude(**{f"{campo}__in": valores}).delete()
+        for valor in valores:
+            modelo.objects.get_or_create(videojuego=instancia, **{campo: valor})
+
+    def create(self, validated_data):
+        categorias = validated_data.pop("categorias", [])
+        generos = validated_data.pop("generos", [])
+        with transaction.atomic():
+            instancia = super().create(validated_data)
+            self._sincronizar(VideojuegoCategoria, "categoria", instancia, categorias)
+            self._sincronizar(VideojuegoGenero, "genero", instancia, generos)
+        return instancia
+
+    def update(self, instance, validated_data):
+        categorias = validated_data.pop("categorias", None)
+        generos = validated_data.pop("generos", None)
+        with transaction.atomic():
+            instancia = super().update(instance, validated_data)
+            self._sincronizar(VideojuegoCategoria, "categoria", instancia, categorias)
+            self._sincronizar(VideojuegoGenero, "genero", instancia, generos)
+        return instancia
+
 
 class VideojuegoResumenSerializer(serializers.ModelSerializer):
-    categoria_nombre = serializers.CharField(source="categoria.nombre", read_only=True)
-    genero_nombre = serializers.CharField(source="genero.nombre", read_only=True)
+    categoria = _PrimerRelacionadoField(
+        queryset=Categoria.objects, related_name="categorias", read_only=True
+    )
+    categoria_nombre = serializers.SerializerMethodField()
+    categorias = _RelacionadosField(
+        queryset=Categoria.objects, related_name="categorias", read_only=True
+    )
+    genero = _PrimerRelacionadoField(
+        queryset=Genero.objects, related_name="generos", read_only=True
+    )
+    genero_nombre = serializers.SerializerMethodField()
+    generos = _RelacionadosField(
+        queryset=Genero.objects, related_name="generos", read_only=True
+    )
 
     class Meta:
         model = Videojuego
@@ -180,10 +359,20 @@ class VideojuegoResumenSerializer(serializers.ModelSerializer):
             "titulo",
             "categoria",
             "categoria_nombre",
+            "categorias",
             "genero",
             "genero_nombre",
+            "generos",
             "activo",
         ]
+
+    def get_categoria_nombre(self, obj):
+        primero = _primero_por_nombre(obj.categorias)
+        return primero.nombre if primero is not None else None
+
+    def get_genero_nombre(self, obj):
+        primero = _primero_por_nombre(obj.generos)
+        return primero.nombre if primero is not None else None
 
 
 # ── Carrito y pedidos ────────────────────────────────────────────────────────
@@ -234,17 +423,45 @@ class DetallePedidoSerializer(serializers.ModelSerializer):
         return OfertaEnDetalleSerializer(obj.oferta, context=self.context).data
 
 
-class CarritoItemCreateSerializer(serializers.Serializer):
+class CarritoDetalleSerializer(DetallePedidoSerializer):
+    """Línea del carrito con su disponibilidad actual frente al catálogo."""
+
+    disponible = serializers.SerializerMethodField()
+    motivo_no_disponible = serializers.SerializerMethodField()
+
+    class Meta(DetallePedidoSerializer.Meta):
+        fields = [*DetallePedidoSerializer.Meta.fields, "disponible", "motivo_no_disponible"]
+
+    def get_disponible(self, obj):
+        return motivo_indisponibilidad(obj) is None
+
+    def get_motivo_no_disponible(self, obj):
+        return motivo_indisponibilidad(obj)
+
+
+class _LimiteCantidadCarrito:
+    """Comparte la validación del tope configurable de unidades por línea."""
+
+    def validate_cantidad(self, value):
+        limite = settings.CARRITO_MAX_CANTIDAD_POR_LINEA
+        if value > limite:
+            raise serializers.ValidationError(
+                f"La cantidad máxima por línea es {limite}."
+            )
+        return value
+
+
+class CarritoItemCreateSerializer(_LimiteCantidadCarrito, serializers.Serializer):
     oferta = serializers.PrimaryKeyRelatedField(queryset=OfertaVideojuego.objects.all())
     cantidad = serializers.IntegerField(min_value=1, default=1)
 
 
-class CarritoItemUpdateSerializer(serializers.Serializer):
+class CarritoItemUpdateSerializer(_LimiteCantidadCarrito, serializers.Serializer):
     cantidad = serializers.IntegerField(min_value=0)
 
 
 class CarritoSerializer(serializers.ModelSerializer):
-    detalles = DetallePedidoSerializer(many=True, read_only=True)
+    detalles = CarritoDetalleSerializer(many=True, read_only=True)
     total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     total_items = serializers.SerializerMethodField()
 
@@ -265,8 +482,14 @@ class CarritoSerializer(serializers.ModelSerializer):
 
 
 class PagoResumenSerializer(serializers.ModelSerializer):
+    """Intento de pago con la forma JSON histórica (``monto`` = ``importe``)."""
+
+    monto = serializers.DecimalField(
+        source="importe", max_digits=10, decimal_places=2, read_only=True
+    )
+
     class Meta:
-        model = Pago
+        model = IntentoPago
         fields = ["id", "monto", "estado", "referencia", "creado_en"]
 
 
@@ -283,6 +506,7 @@ class PedidoSerializer(serializers.ModelSerializer):
     total = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     puede_cancelar = serializers.BooleanField(read_only=True)
     pago = serializers.SerializerMethodField()
+    intentos_pago = PagoResumenSerializer(many=True, read_only=True)
     venta = serializers.SerializerMethodField()
 
     class Meta:
@@ -296,13 +520,20 @@ class PedidoSerializer(serializers.ModelSerializer):
             "puede_cancelar",
             "detalles",
             "pago",
+            "intentos_pago",
             "venta",
             "creado_en",
             "actualizado_en",
         ]
 
     def get_pago(self, obj):
-        pago = getattr(obj, "pago", None)
+        # El viewset precarga el intento aprobado; fuera de él se usa la
+        # propiedad de compatibilidad ``Pedido.pago``.
+        aprobados = getattr(obj, "_intentos_aprobados", None)
+        if aprobados is not None:
+            pago = aprobados[0] if aprobados else None
+        else:
+            pago = getattr(obj, "pago", None)
         if pago is None:
             return None
         return PagoResumenSerializer(pago, context=self.context).data
@@ -317,10 +548,12 @@ class PedidoSerializer(serializers.ModelSerializer):
 class PedidoEstadoSerializer(serializers.Serializer):
     """Transición de estado permitida a través de ``PATCH /pedidos/{id}/``."""
 
-    estado = serializers.ChoiceField(choices=Pedido.Estado.choices)
+    estado = serializers.CharField()
 
     def validate_estado(self, value):
-        if value != Pedido.Estado.CANCELADO:
+        if value not in codigos_estado_pedido():
+            raise serializers.ValidationError(f'"{value}" no es una opción válida.')
+        if value != "cancelado":
             raise serializers.ValidationError(
                 "La única transición permitida por este endpoint es 'cancelado'."
             )
@@ -332,9 +565,12 @@ class PedidoEstadoSerializer(serializers.Serializer):
 class PagoSerializer(serializers.ModelSerializer):
     pedido = serializers.IntegerField(source="pedido_id", read_only=True)
     cliente = serializers.CharField(source="pedido.cliente.username", read_only=True)
+    monto = serializers.DecimalField(
+        source="importe", max_digits=10, decimal_places=2, read_only=True
+    )
 
     class Meta:
-        model = Pago
+        model = IntentoPago
         fields = [
             "id",
             "pedido",
@@ -370,14 +606,32 @@ class VentaSerializer(serializers.ModelSerializer):
 # ── Cuentas ──────────────────────────────────────────────────────────────────
 
 class RolSerializer(serializers.ModelSerializer):
+    """``nombre`` conserva el texto histórico del contrato v1.
+
+    La semilla puede tener etiquetas visibles con otra capitalización; el
+    código estable es el que la API expuso siempre como ``nombre``.
+    """
+
+    nombre = serializers.SerializerMethodField()
+
     class Meta:
         model = Rol
-        fields = ["id", "nombre", "descripcion", "activo"]
+        fields = ["id", "codigo", "nombre", "descripcion", "activo"]
+
+    def get_nombre(self, obj):
+        return obj.codigo or obj.nombre
 
 
 class UsuarioSerializer(serializers.ModelSerializer):
-    rol = serializers.IntegerField(source="rol_id", read_only=True)
+    # ``rol``/``rol_nombre`` son los campos históricos: exponen el primero por
+    # nombre y el código estable, respectivamente. ``roles`` es la lista nueva.
+    rol = _PrimerRelacionadoField(
+        queryset=Rol.objects, related_name="roles", read_only=True
+    )
     rol_nombre = serializers.SerializerMethodField()
+    roles = _RelacionadosField(
+        queryset=Rol.objects, related_name="roles", read_only=True
+    )
 
     class Meta:
         model = Usuario
@@ -391,6 +645,7 @@ class UsuarioSerializer(serializers.ModelSerializer):
             "direccion",
             "rol",
             "rol_nombre",
+            "roles",
             "is_active",
             "is_staff",
             "date_joined",
@@ -398,12 +653,226 @@ class UsuarioSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_rol_nombre(self, obj):
-        return obj.rol.nombre if obj.rol_id else None
+        primero = _primero_por_nombre(obj.roles)
+        return primero.codigo if primero is not None else None
+
+
+class UsuarioAdminCreateSerializer(serializers.ModelSerializer):
+    """Alta de usuarios internos con contraseña y uno o más roles."""
+
+    password = serializers.CharField(write_only=True, trim_whitespace=False)
+    password_confirm = serializers.CharField(write_only=True, trim_whitespace=False)
+    roles = serializers.PrimaryKeyRelatedField(
+        queryset=Rol.objects.all(), many=True, required=False
+    )
+    rol = serializers.PrimaryKeyRelatedField(
+        queryset=Rol.objects.all(), required=False, write_only=True
+    )
+
+    class Meta:
+        model = Usuario
+        fields = [
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "telefono",
+            "direccion",
+            "roles",
+            "rol",
+            "password",
+            "password_confirm",
+        ]
+        extra_kwargs = {
+            "username": {"validators": []},
+            "first_name": {"required": False},
+            "last_name": {"required": False},
+            "telefono": {"required": False},
+            "direccion": {"required": False},
+        }
+
+    def validate_username(self, value):
+        if Usuario.objects.filter(username__iexact=value).exists():
+            raise serializers.ValidationError("Ya existe un usuario con ese nombre.")
+        return value
+
+    def validate_email(self, value):
+        if Usuario.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError(
+                "Ya existe una cuenta con ese correo electrónico."
+            )
+        return value
+
+    def validate(self, attrs):
+        if attrs["password"] != attrs["password_confirm"]:
+            raise serializers.ValidationError(
+                {"password_confirm": "Las contraseñas no coinciden."}
+            )
+
+        if "roles" in attrs and "rol" in attrs:
+            raise serializers.ValidationError(
+                {"roles": "Usa 'roles' o 'rol', pero no ambos."}
+            )
+        if "rol" in attrs:
+            attrs["roles"] = [attrs.pop("rol")]
+        if not attrs.get("roles"):
+            raise serializers.ValidationError(
+                {"roles": "Debe asignar al menos un rol."}
+            )
+
+        candidato = Usuario(
+            username=attrs.get("username", ""),
+            email=attrs.get("email", ""),
+            first_name=attrs.get("first_name", ""),
+            last_name=attrs.get("last_name", ""),
+        )
+        try:
+            password_validation.validate_password(attrs["password"], candidato)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError(
+                {"password": list(exc.messages)}
+            ) from exc
+        return attrs
+
+
+class UsuarioAdminUpdateSerializer(serializers.ModelSerializer):
+    """Edición administrativa de datos, roles y estado (``is_active``)."""
+
+    roles = serializers.PrimaryKeyRelatedField(
+        queryset=Rol.objects.all(), many=True, required=False
+    )
+    rol = serializers.PrimaryKeyRelatedField(
+        queryset=Rol.objects.all(), required=False, write_only=True
+    )
+
+    class Meta:
+        model = Usuario
+        fields = [
+            "username",
+            "email",
+            "first_name",
+            "last_name",
+            "telefono",
+            "direccion",
+            "is_active",
+            "roles",
+            "rol",
+        ]
+        extra_kwargs = {
+            "username": {"validators": [], "required": False},
+            "email": {"required": False},
+        }
+
+    def validate_username(self, value):
+        if (
+            Usuario.objects.filter(username__iexact=value)
+            .exclude(pk=self.instance.pk)
+            .exists()
+        ):
+            raise serializers.ValidationError("Ya existe un usuario con ese nombre.")
+        return value
+
+    def validate_email(self, value):
+        if (
+            Usuario.objects.filter(email__iexact=value)
+            .exclude(pk=self.instance.pk)
+            .exists()
+        ):
+            raise serializers.ValidationError(
+                "Ya existe una cuenta con ese correo electrónico."
+            )
+        return value
+
+    def validate(self, attrs):
+        if "roles" in attrs and "rol" in attrs:
+            raise serializers.ValidationError(
+                {"roles": "Usa 'roles' o 'rol', pero no ambos."}
+            )
+        if "rol" in attrs:
+            attrs["roles"] = [attrs.pop("rol")]
+        if "roles" in attrs and not attrs["roles"]:
+            raise serializers.ValidationError(
+                {"roles": "Debe asignar al menos un rol."}
+            )
+        return attrs
+
+
+class RolAdminSerializer(serializers.ModelSerializer):
+    """Escritura administrativa del catálogo de roles."""
+
+    class Meta:
+        model = Rol
+        fields = ["id", "codigo", "nombre", "descripcion", "activo"]
+        extra_kwargs = {
+            "codigo": {"validators": []},
+            "descripcion": {"required": False},
+            "activo": {"required": False},
+        }
+
+    def validate_codigo(self, value):
+        codigo = value.strip().lower()
+        if not re.fullmatch(r"[a-z][a-z0-9_]*", codigo):
+            raise serializers.ValidationError(
+                "El código debe empezar por una letra y usar solo letras "
+                "minúsculas, números y guiones bajos."
+            )
+        return codigo
+
+    def validate_nombre(self, value):
+        nombre = value.strip()
+        if not nombre:
+            raise serializers.ValidationError("El nombre no puede estar vacío.")
+        return nombre
+
+    def validate(self, attrs):
+        codigo = attrs.get("codigo", getattr(self.instance, "codigo", None))
+        nombre = attrs.get("nombre", getattr(self.instance, "nombre", None))
+        existentes = Rol.objects.all()
+        if self.instance is not None:
+            existentes = existentes.exclude(pk=self.instance.pk)
+        if codigo and existentes.filter(codigo__iexact=codigo).exists():
+            raise serializers.ValidationError(
+                {"codigo": "Ya existe un rol con ese código."}
+            )
+        if nombre and existentes.filter(nombre__iexact=nombre).exists():
+            raise serializers.ValidationError(
+                {"nombre": "Ya existe un rol con ese nombre."}
+            )
+        return attrs
+
+
+class AuditoriaCuentaSerializer(serializers.ModelSerializer):
+    actor_username = serializers.CharField(source="actor.username", read_only=True)
+    usuario_username = serializers.CharField(
+        source="usuario_afectado.username", read_only=True
+    )
+    accion_nombre = serializers.CharField(source="get_accion_display", read_only=True)
+
+    class Meta:
+        model = AuditoriaCuenta
+        fields = [
+            "id",
+            "accion",
+            "accion_nombre",
+            "actor",
+            "actor_username",
+            "usuario_afectado",
+            "usuario_username",
+            "detalles",
+            "direccion_ip",
+            "fecha_hora",
+        ]
+        read_only_fields = fields
 
 
 class PerfilSerializer(serializers.ModelSerializer):
-    rol = serializers.IntegerField(source="rol_id", read_only=True, default=None)
+    rol = _PrimerRelacionadoField(
+        queryset=Rol.objects, related_name="roles", read_only=True
+    )
     rol_nombre = serializers.SerializerMethodField()
+    roles = _RelacionadosField(
+        queryset=Rol.objects, related_name="roles", read_only=True
+    )
 
     class Meta:
         model = Usuario
@@ -418,12 +887,14 @@ class PerfilSerializer(serializers.ModelSerializer):
             "foto",
             "rol",
             "rol_nombre",
+            "roles",
             "date_joined",
         ]
-        read_only_fields = ["id", "username", "rol", "rol_nombre", "date_joined"]
+        read_only_fields = ["id", "username", "rol", "rol_nombre", "roles", "date_joined"]
 
     def get_rol_nombre(self, obj):
-        return obj.rol.nombre if obj.rol_id else None
+        primero = _primero_por_nombre(obj.roles)
+        return primero.codigo if primero is not None else None
 
     def validate_email(self, value):
         if not value:
@@ -491,10 +962,13 @@ class RegistroSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         validated_data.pop("password_confirm")
         password = validated_data.pop("password")
-        rol_cliente, _ = Rol.objects.get_or_create(nombre="cliente")
-        usuario = Usuario(**validated_data, rol=rol_cliente)
+        rol_cliente, _ = Rol.objects.get_or_create(
+            codigo="cliente", defaults={"nombre": "cliente"}
+        )
+        usuario = Usuario(**validated_data)
         usuario.set_password(password)
         usuario.save()
+        usuario.roles.add(rol_cliente)
         return usuario
 
 
@@ -576,3 +1050,67 @@ class SolicitudInformacionSerializer(serializers.Serializer):
     nombre = serializers.CharField(max_length=150)
     email = serializers.EmailField()
     telefono = serializers.CharField(max_length=20, required=False, allow_blank=True)
+
+
+# ── Inventario (AZ-S2-BE-03) ─────────────────────────────────────────────────
+
+class MovimientoInventarioSerializer(serializers.ModelSerializer):
+    """Movimiento del libro mayor; nunca se escribe desde la API."""
+
+    tipo = serializers.CharField(source="tipo_movimiento.codigo", read_only=True)
+    motivo = serializers.SerializerMethodField()
+    usuario = serializers.SerializerMethodField()
+    oferta_sku = serializers.CharField(source="oferta.sku", read_only=True)
+    pedido = serializers.SerializerMethodField()
+
+    class Meta:
+        model = MovimientoInventarioOfertaVideojuego
+        fields = [
+            "id",
+            "oferta",
+            "oferta_sku",
+            "tipo",
+            "motivo",
+            "cantidad",
+            "unidad",
+            "saldo_anterior",
+            "saldo_posterior",
+            "fecha_hora",
+            "usuario",
+            "usuario_responsable",
+            "detalle_pedido",
+            "pedido",
+            "observacion",
+            "clave_idempotencia",
+        ]
+        read_only_fields = fields
+
+    def get_motivo(self, obj):
+        return obj.motivo.codigo if obj.motivo_id else None
+
+    def get_usuario(self, obj):
+        return obj.usuario_responsable.username if obj.usuario_responsable_id else None
+
+    def get_pedido(self, obj):
+        return obj.detalle_pedido.pedido_id if obj.detalle_pedido_id else None
+
+
+class AjusteInventarioSerializer(serializers.Serializer):
+    """Cuerpo de ``POST /inventario/ajustes/``."""
+
+    oferta = serializers.PrimaryKeyRelatedField(queryset=OfertaVideojuego.objects.all())
+    cantidad = serializers.IntegerField()
+    motivo = serializers.SlugRelatedField(
+        slug_field="codigo",
+        queryset=MotivoMovimientoInventario.objects.filter(activo=True),
+        error_messages={
+            "does_not_exist": "El motivo no existe o no está activo.",
+            "incorrect_type": "El motivo debe ser su código (p. ej. AJUSTE_FISICO).",
+        },
+    )
+    nota = serializers.CharField(required=False, allow_blank=True, default="")
+
+    def validate_cantidad(self, valor):
+        if valor == 0:
+            raise serializers.ValidationError("La cantidad debe ser distinta de cero.")
+        return valor

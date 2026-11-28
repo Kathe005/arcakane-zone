@@ -4,21 +4,26 @@ from rest_framework import serializers, status
 from rest_framework.generics import GenericAPIView
 from rest_framework.response import Response
 
-from catalogo.models import Categoria, Genero, OfertaVideojuego, Plataforma
+from catalogo.models import (
+    Categoria,
+    Genero,
+    OfertaVideojuego,
+    Plataforma,
+)
 from pagos.models import Venta
 from pedidos.models import Pedido
 from reportes.views import UMBRAL_BAJO_STOCK
 
 from ..exceptions import respuesta_exitosa
 from ..pagination import StandardResultsSetPagination
-from ..permissions import EsAdministrador
+from ..permissions import TieneRolReporte, TieneRolReporteInventario
 from ..serializers import OfertaVideojuegoSerializer, VentaSerializer
 
 
 def _ofertas_catalogo():
     return OfertaVideojuego.objects.select_related(
-        "videojuego", "videojuego__categoria", "videojuego__genero", "plataforma"
-    )
+        "videojuego", "plataforma", "estado_publicacion"
+    ).prefetch_related("videojuego__categorias", "videojuego__generos")
 
 
 def _monto(valor) -> str:
@@ -27,7 +32,7 @@ def _monto(valor) -> str:
 
 
 class ReporteBaseView(GenericAPIView):
-    permission_classes = [EsAdministrador]
+    permission_classes = [TieneRolReporte]
     pagination_class = StandardResultsSetPagination
 
     def _paginar(self, queryset, serializer_class, **extra):
@@ -111,6 +116,7 @@ class ReporteVentasView(ReporteBaseView):
         ventas = Venta.objects.select_related("pedido", "pedido__cliente").prefetch_related(
             "pedido__detalles__oferta__videojuego",
             "pedido__detalles__oferta__plataforma",
+            "pedido__detalles__oferta__estado_publicacion",
         )
         if datos.get("desde"):
             ventas = ventas.filter(registrada_en__date__gte=datos["desde"])
@@ -140,6 +146,7 @@ class ReporteInventarioQuerySerializer(serializers.Serializer):
 
 
 class ReporteInventarioView(ReporteBaseView):
+    permission_classes = [TieneRolReporteInventario]
     serializer_class = OfertaVideojuegoSerializer
 
     def get(self, request):
@@ -159,9 +166,7 @@ class ReporteInventarioView(ReporteBaseView):
                 stock__gt=UMBRAL_BAJO_STOCK, videojuego__activo=True
             )
         elif filtro == "inactivas":
-            ofertas = ofertas.exclude(
-                estado_publicacion=OfertaVideojuego.EstadoPublicacion.PUBLICADO
-            )
+            ofertas = ofertas.exclude(estado_publicacion_id="publicado")
 
         return self._paginar(
             ofertas,
@@ -201,9 +206,9 @@ class ReporteVideojuegosView(ReporteBaseView):
 
         ofertas = _ofertas_catalogo().order_by("videojuego__titulo", "plataforma__nombre")
         if datos.get("categoria"):
-            ofertas = ofertas.filter(videojuego__categoria_id=datos["categoria"])
+            ofertas = ofertas.filter(videojuego__categorias__id=datos["categoria"])
         if datos.get("genero"):
-            ofertas = ofertas.filter(videojuego__genero_id=datos["genero"])
+            ofertas = ofertas.filter(videojuego__generos__id=datos["genero"])
         if datos.get("plataforma"):
             ofertas = ofertas.filter(plataforma_id=datos["plataforma"])
         if datos.get("estado") == "activo":
@@ -215,6 +220,8 @@ class ReporteVideojuegosView(ReporteBaseView):
         elif datos.get("disponibilidad") == "agotado":
             ofertas = ofertas.publicadas().filter(stock=0, videojuego__activo=True)
 
+        # Los filtros por catálogo M2M no deben duplicar ofertas paginadas.
+        ofertas = ofertas.distinct()
         return self._paginar(
             ofertas,
             OfertaVideojuegoSerializer,

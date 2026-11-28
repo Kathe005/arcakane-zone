@@ -20,7 +20,7 @@ Archivos relevantes de esta carpeta:
 
 - `Dockerfile`: imagen de producción basada en `python:3.12.9-slim`, usuario no privilegiado y Gunicorn por defecto.
 - `.dockerignore`: excluye `.env`, `.venv`, pruebas, medios y estáticos locales del contexto de build.
-- `docker/entrypoint.sh`: espera a PostgreSQL, aplica migraciones, recolecta estáticos y opcionalmente ejecuta `seed_catalogo`.
+- `docker/entrypoint.sh`: espera a PostgreSQL, crea la tabla de caché si hace falta, aplica migraciones, recolecta estáticos y opcionalmente ejecuta `seed_catalogo`.
 
 Comandos habituales dentro del contenedor:
 
@@ -30,6 +30,16 @@ docker compose exec backend python manage.py createsuperuser
 docker compose exec backend python manage.py seed_catalogo
 docker compose exec backend python manage.py shell
 ```
+
+### Throttling y caché
+
+Los límites de la API (`anon`, `user`, `login`, `registro`, `contacto`) se
+guardan en caché. Por defecto se usa la tabla `django_cache` de PostgreSQL;
+el entrypoint la crea con `python manage.py createcachetable` de forma
+idempotente. Para usar Redis, define `REDIS_URL` (requiere el paquete `redis`).
+Las tasas y el bloqueo de login se configuran con las variables
+`THROTTLE_RATE_*`, `THROTTLE_NUM_PROXIES` y `LOGIN_*` documentadas en
+[`.env.example`](.env.example) y en [`docs/api/API.md`](../docs/api/API.md).
 
 ## Estructura
 
@@ -83,8 +93,10 @@ cp .env.example .env
 
 | Variable | Obligatoria | Descripción |
 |---|---|---|
-| `SECRET_KEY` | Sí | Clave secreta de Django. No debe compartirse ni versionarse. |
+| `SECRET_KEY` | Sí | Clave secreta de Django. No debe compartirse ni versionarse. Con `DEBUG=False` se exige una clave real de al menos 50 caracteres; la arranque falla si está vacía o es de ejemplo (`openssl rand -hex 32`). |
 | `DATABASE_URL` | Condicional | URL de conexión PostgreSQL, por ejemplo `postgres://usuario:clave@host:5432/db`. Si no se define, se usan las variables `POSTGRES_*`. |
+| `API_TOKEN_TTL_DAYS` | No | Días de vigencia de los tokens de API; por defecto `7` (mínimo `1`). |
+| `CARRITO_MAX_CANTIDAD_POR_LINEA` | No | Unidades máximas por línea del carrito; por defecto `20` (mínimo `1`). Aplica a API y vistas HTML. |
 | `POSTGRES_DB` | Condicional | Nombre de la base de datos cuando se usa el fallback de Docker Compose. |
 | `POSTGRES_USER` | Condicional | Usuario de PostgreSQL cuando se usa el fallback de Docker Compose. |
 | `POSTGRES_PASSWORD` | Condicional | Contraseña de PostgreSQL cuando se usa el fallback de Docker Compose. |
@@ -94,8 +106,12 @@ cp .env.example .env
 | `ALLOWED_HOSTS` | No | Lista separada por comas. Por defecto `localhost,127.0.0.1,backend`. |
 | `CSRF_TRUSTED_ORIGINS` | No | Orígenes permitidos para CSRF. En Render se agrega automáticamente el host público. |
 | `CORS_ALLOWED_ORIGINS` | No | Orígenes permitidos para CORS (lista separada por comas). Solo hace falta si el frontend llama a la API sin el proxy `/api`. |
-| `SECURE_SSL_REDIRECT` | No | Fuerza HTTPS cuando `DEBUG=False`; por defecto `True`. En Docker se pone `False` porque TLS termina en el proxy. |
+| `SECURE_SSL_REDIRECT` | No | Fuerza HTTPS cuando `DEBUG=False`; por defecto `True` en producción y `False` en desarrollo. El proxy debe enviar `X-Forwarded-Proto: https`. |
 | `USE_X_FORWARDED_HOST` | No | Usa `X-Forwarded-Host` detrás de un proxy; por defecto `False`. |
+| `SECURE_REFERRER_POLICY` | No | Política de `Referrer-Policy`; por defecto `same-origin`. |
+| `SESSION_COOKIE_SAMESITE` | No | Política `SameSite` de la cookie de sesión; por defecto `Lax`. |
+| `SECURE_HSTS_PRELOAD` | No | Añade `preload` a HSTS; por defecto `True`. Desactívalo si el dominio no se va a someter a la lista de precarga. |
+| `LOG_LEVEL` | No | Nivel de logs (`INFO` por defecto). Con `DEBUG=False` se emite JSON en `stdout`. |
 | `RENDER_EXTERNAL_HOSTNAME` | No | La define Render; se agrega a `ALLOWED_HOSTS` y `CSRF_TRUSTED_ORIGINS`. |
 | `AWS_ACCESS_KEY_ID` | No | Si se define, activa almacenamiento S3 para medios. |
 | `AWS_SECRET_ACCESS_KEY` | No | Credencial S3. |
@@ -116,7 +132,48 @@ python manage.py seed_catalogo
 python manage.py createsuperuser
 ```
 
-`seed_catalogo` crea roles, categorías, plataformas, géneros y 15 videojuegos de ejemplo. Es idempotente para los datos que ya existen.
+`seed_catalogo` crea roles, las seis categorías base, plataformas, géneros y
+**140 videojuegos reales**: 20 por cada una de las seis categorías base y 20
+títulos adicionales que se asignan a categorías creadas aparte. Cada ficha
+(título, desarrollador, fecha, descripción, precio, stock y portada) viene del
+fixture `catalogo/datos/catalogo_real.json`, obtenido de Steam y Wikipedia en
+español. El objetivo global es `max(100, 20 × número_de_categorías)`.
+Es idempotente: repetirlo no crea duplicados y solo completa las relaciones
+que falten.
+
+Al terminar imprime la evidencia de carga:
+
+```text
+  Videojuegos:    120 creados
+  Ofertas:        167 creadas
+  Total videojuegos: 120 (mínimo 120)
+    - Acción: 20
+    - Aventura: 20
+    - Carreras: 20
+    - Deportes: 20
+    - Estrategia: 20
+    - RPG: 20
+```
+
+Para **restablecer** solo los datos semilla (borra también usuarios y pedidos):
+
+```bash
+python manage.py flush --noinput
+python manage.py migrate
+python manage.py seed_catalogo
+python manage.py createsuperuser
+```
+
+### Conciliación de inventario
+
+`verificar_inventario` es de solo lectura: compara `OfertaVideojuego.stock` con la suma de movimientos del libro mayor, imprime un resumen y las discrepancias (oferta, stock registrado, suma y diferencia), y termina con código distinto de cero si hay diferencias.
+
+```bash
+python manage.py verificar_inventario
+python manage.py verificar_inventario --oferta 12
+```
+
+La suma aplica `ENTRADA` (`+`), `SALIDA` (`-`) y `AJUSTE`/`CARGA_INICIAL` (fija el saldo de apertura o reconteo). Un stock inicial cargado fuera del libro mayor aparece como diferencia; el comando nunca corrige nada.
 
 Para un smoke test local con SQLite se puede usar una URL temporal, sin modificar `.env`:
 
@@ -145,8 +202,9 @@ pip install -r requirements-dev.txt
 SECRET_KEY=test-key DATABASE_URL=sqlite:///db.sqlite3 DEBUG=True pytest
 ```
 
-Estado verificado de la suite: **130 pruebas**, todas pasan. Incluye pruebas de
-la API REST (`tests/test_api_*.py`) y las pruebas originales de la interfaz HTML.
+Estado verificado de la suite: **1871 pruebas**, todas pasan. Incluye pruebas de
+la API REST (`tests/test_api_*.py`), la matriz RBAC, la administración de
+usuarios/roles por API y las pruebas originales de la interfaz HTML.
 
 `settings_test.py` fuerza `DEBUG=True`, desactiva las redirecciones HTTPS y usa
 SQLite en memoria, por lo que la suite es independiente del entorno.
@@ -175,15 +233,25 @@ SQLite en memoria, por lo que la suite es independiente del entorno.
 ## API REST
 
 - **Base:** `/api/v1/` (raíz navegable en `GET /api/v1/`).
-- **Salud:** `GET /api/v1/health/`.
-- **Autenticación:** token de DRF (`Authorization: Bearer <token>`) o sesión de
-  Django con `X-CSRFToken`.
+- **Salud:** `GET /api/v1/health/` (*liveness*) y `GET /api/v1/health/ready/` (*readiness*, consulta la BD y responde `503` si falla).
+- **Trazabilidad:** cada respuesta `/api/` devuelve `X-Request-ID` (se acepta la cabecera del cliente); el mismo valor se incluye en los logs JSON de producción y en los errores `500`.
+- **Carrito:** `GET /carrito/` sincroniza precios y devuelve `advertencias` (`precio_cambiado`, `sin_stock`, `no_disponible`); el pago responde `409` con `error.details.ajustes` si el carrito cambió después de esa consulta.
+- **Autenticación:** token propio con vencimiento
+  (`Authorization: Token <clave>`) o sesión de Django con `X-CSRFToken`.
+  Login y registro devuelven `token` y `expires_at`; existen
+  `POST /api/v1/auth/token/refresh/` y `POST /api/v1/auth/logout-all/`.
+  Los tokens antiguos de DRF ya no autentican: vuelve a iniciar sesión.
 - **Respuestas:** sobre uniforme `{"success": true, "data": ...}` y errores
   `{"success": false, "error": {"code", "message", "details"}}`.
 - **Paginación:** `?page=1&page_size=20`; búsqueda `?q=`; orden `?ordering=`.
 
-Recursos principales: catálogo, carrito, pedidos, pagos, ventas, reportes,
-soporte, usuarios y roles. El detalle de rutas, cuerpos y códigos de estado está
+Recursos principales: catálogo, carrito, pedidos, pagos, ventas, inventario
+(movimientos y ajustes), reportes, soporte, usuarios y roles. La administración
+de cuentas (solo administradores) permite crear/editar usuarios con roles,
+activarlos o desactivarlos y mantener el CRUD de roles; las reglas de
+autodesactivación, último administrador y jerarquía de roles se aplican en
+`api/cuentas_service.py`, y cada cambio queda en `AuditoriaCuenta`. El detalle
+de rutas, cuerpos y códigos de estado está
 en [`docs/api/API.md`](../docs/api/API.md).
 
 ```bash
@@ -206,9 +274,11 @@ El blueprint está en la raíz del repositorio: [`../render.yaml`](../render.yam
 - `rootDir: backend`: Render ejecuta los comandos dentro de esta carpeta.
 - Build: `./build.sh`.
   - Instala `requirements.txt`.
+  - Ejecuta `python manage.py check --deploy`.
   - Ejecuta `collectstatic --no-input`.
   - Ejecuta `migrate`.
 - Start: `gunicorn arkane_zone.wsgi:application --bind 0.0.0.0:$PORT --workers 2 --timeout 120`.
+- Healthcheck: `healthCheckPath: /api/v1/health/ready/`.
 - Estáticos: WhiteNoise con `CompressedManifestStaticFilesStorage`.
 - Variables sensibles: `SECRET_KEY`, `DATABASE_URL` y `ALLOWED_HOSTS` se configuran manualmente en Render (`sync: false`).
 
@@ -216,9 +286,10 @@ El blueprint está en la raíz del repositorio: [`../render.yaml`](../render.yam
 
 - **Medios:** si no se configuran las variables `AWS_*`, las portadas y fotos se guardan en el sistema de archivos local de Render, que es efímero. Además, `/media/` solo se sirve con `DEBUG=True`. Para producción se debe configurar S3/Supabase Storage o aceptar explícitamente la limitación.
 - **Correo:** `EMAIL_BACKEND` está fijado al backend de consola. El reseteo de contraseña no envía correos reales y los enlaces quedan en los logs. Configurar SMTP antes de habilitar recuperación de contraseña en producción.
-- **Proxy HTTPS:** `SECURE_PROXY_SSL_HEADER` está configurado para confiar en `X-Forwarded-Proto`. En Docker, `SECURE_SSL_REDIRECT` se desactiva dentro del contenedor porque TLS termina en el proxy inverso; el healthcheck interno usa HTTP.
+- **Proxy HTTPS:** `SECURE_PROXY_SSL_HEADER` está configurado para confiar en `X-Forwarded-Proto`. Con `DEBUG=False`, `SECURE_SSL_REDIRECT` queda activo; el proxy (y el healthcheck interno de Compose) debe enviar esa cabecera con valor `https`.
+- **Readiness:** `healthCheckPath` de Render y el healthcheck de Compose apuntan a `/api/v1/health/ready/`; no a `/health/`.
 - **Migraciones:** actualmente se ejecutan durante el build. Evaluar un `preDeployCommand` antes de un despliegue con más de una instancia.
-- **Validación:** ejecutar `python manage.py check --deploy` antes de cada despliegue.
+- **Validación:** `build.sh` y la CI ejecutan `python manage.py check --deploy` con `DEBUG=False`; debe terminar sin advertencias.
 
 ## Convivencia con el frontend
 
@@ -228,7 +299,7 @@ para el panel administrativo:
 
 1. El frontend usa `/api/v1/...` mediante el proxy de Vite/Nginx, sin CORS en
    el flujo normal.
-2. Los clientes externos pueden autenticarse con token de DRF.
+2. Los clientes externos pueden autenticarse con el token propio de la API.
 3. La administración interna permanece en `/admin/` con django-unfold.
 4. Las plantillas se pueden retirar gradualmente sin tocar la lógica de negocio.
 

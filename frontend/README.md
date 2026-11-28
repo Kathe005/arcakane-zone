@@ -12,7 +12,8 @@ frontend/
 │   ├── App.tsx           # Componente raíz
 │   ├── main.tsx          # Punto de entrada
 │   ├── index.css         # Estilos globales
-│   └── App.css
+│   ├── App.css
+│   └── features/catalog/api.ts  # Consulta paginada y validada del catálogo
 ├── public/
 ├── Dockerfile            # targets: development y production
 ├── .dockerignore
@@ -65,9 +66,28 @@ El frontend llama a rutas relativas bajo `/api/v1/...`:
 const respuesta = await fetch("/api/v1/health/");
 ```
 
-- Desarrollo: Vite reenvía `/api/v1/...` a `http://backend:8000/api/v1/...`.
+- Desarrollo: Vite reenvía `/api/v1/...` a `http://backend:8000/api/v1/...` y
+  añade `X-Forwarded-Proto: https`, igual que hace Nginx en producción. Sin esa
+  cabecera, un backend con `SECURE_SSL_REDIRECT=True` responde `301` hacia
+  `https://backend:8000/...` y el navegador se queda cargando.
 - Producción: Nginx hace lo mismo usando el nombre de servicio `backend`.
 - El prefijo `/api` **no** se elimina: la API versionada vive en `/api/v1/`.
+- El router de Django exige barra final: usa `/api/v1/catalogo/videojuegos/`,
+  no `/api/v1/catalogo/videojuegos`.
+
+El catálogo (inicio, catálogos, productos y detalle) ya no usa el arreglo de
+demostración: `src/features/catalog/api.ts` consulta `categorias`, `plataformas` y
+`videojuegos` con TanStack Query, recorre todas las páginas (`page_size=100`) y
+valida cada respuesta con Zod antes de transformarla en `Product`. Por eso la
+vista refleja los videojuegos sembrados en el backend y sus ofertas reales.
+`mockData.ts` se conserva únicamente como fixture de los tests de selector y de
+las respuestas simuladas con MSW.
+
+Cada videojuego trae `imagen_url` y `desarrollador` desde la base de datos y se
+muestra como portada y ficha en tarjetas, destacado y detalle. Las 140 portadas
+reales están en `public/covers/reales` y se sirven desde `/covers/reales/`;
+cada título tiene la suya. Si la URL no responde, se sustituye por
+`src/assets/covers/catalog-placeholder.svg` mediante `alFallarPortada`.
 
 Contrato completo: [`docs/api/API.md`](../docs/api/API.md).
 
@@ -80,7 +100,10 @@ FRONTEND_PORT=5173 VITE_DEV_PROXY_TARGET=http://localhost:8000 npm run dev
 ```
 
 Disponible en <http://localhost:5173/>. Si omites `VITE_DEV_PROXY_TARGET`, Vite apunta a
-`http://localhost:8000`, que es útil cuando el backend corre en local.
+`http://localhost:8000`, que es útil cuando el backend corre en local. En ese modo
+local, arranca el backend con `SECURE_SSL_REDIRECT=False` (o detrás de un proxy que
+envíe `X-Forwarded-Proto: https`); de lo contrario Django redirigirá las peticiones
+`/api` y la UI se quedará en «Cargando vista…».
 
 ## Scripts
 

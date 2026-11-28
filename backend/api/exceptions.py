@@ -1,9 +1,11 @@
 """Manejo centralizado de errores y respuestas exitosas de la API."""
 import logging
+import math
 from typing import Any
 
 from django.db import IntegrityError
 from django.db.models.deletion import ProtectedError
+from django.http import Http404
 from rest_framework import status
 from rest_framework.exceptions import (
     APIException,
@@ -17,6 +19,9 @@ from rest_framework.exceptions import (
 )
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
+
+from .observabilidad import request_id_actual
+from .throttling import BloqueoLogin
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +87,8 @@ def _codigo_y_mensaje(exc) -> tuple[str, str]:
         return "no_encontrado", "El recurso solicitado no existe."
     if isinstance(exc, MethodNotAllowed):
         return "metodo_no_permitido", "El método HTTP no está permitido para este recurso."
+    if isinstance(exc, BloqueoLogin):
+        return "demasiadas_solicitudes", str(exc.detail)
     if isinstance(exc, Throttled):
         return "demasiadas_solicitudes", "Se superó el límite de solicitudes. Intenta más tarde."
     if isinstance(exc, ErrorDeNegocio):
@@ -93,6 +100,8 @@ def _codigo_y_mensaje(exc) -> tuple[str, str]:
 
 def api_exception_handler(exc, context):
     """Convierte cualquier excepción en el sobre de error JSON de la API."""
+    if isinstance(exc, Http404):
+        exc = NotFound(str(exc))
     if isinstance(exc, ProtectedError):
         return respuesta_error(
             "conflicto",
@@ -109,7 +118,19 @@ def api_exception_handler(exc, context):
 
     response = exception_handler(exc, context)
     if response is None:
-        logger.exception("Error no controlado en la API", exc_info=exc)
+        peticion = (context or {}).get("request")
+        logger.exception(
+            "Error no controlado en la API",
+            exc_info=exc,
+            extra={
+                "evento": "api_error_no_controlado",
+                "request_id": request_id_actual(),
+                "metodo": getattr(peticion, "method", None),
+                "ruta": getattr(peticion, "path", None),
+                "status_code": 500,
+                "ip": getattr(peticion, "META", {}).get("REMOTE_ADDR"),
+            },
+        )
         return respuesta_error(
             "error_interno",
             "Ocurrió un error interno al procesar la solicitud.",
@@ -132,4 +153,7 @@ def api_exception_handler(exc, context):
     if detalles:
         payload["error"]["details"] = detalles
     response.data = payload
+    if isinstance(exc, Throttled) and getattr(exc, "wait", None) is not None:
+        # DRF ya lo hace, pero lo reforzamos para no perderlo al reemplazar data.
+        response["Retry-After"] = str(max(1, math.ceil(exc.wait)))
     return response

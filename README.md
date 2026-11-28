@@ -87,6 +87,17 @@ Para cargar datos de ejemplo del catálogo:
 docker compose exec backend python manage.py seed_catalogo
 ```
 
+El seed siembra **140 videojuegos reales**: 20 por cada una de las seis
+categorías base y 20 títulos adicionales para categorías creadas aparte. Cada
+juego lleva título, desarrollador, fecha, descripción, precio, stock y portada
+verdaderos (fuente: Steam y Wikipedia ES), guardados en
+`backend/catalogo/datos/catalogo_real.json`. El entrypoint siembra
+automáticamente una base de datos vacía, aunque `SEED_CATALOGO=false`.
+Al terminar imprime el total y la distribución. Es idempotente: puede
+repetirse sin duplicados. Para reiniciar los datos semilla, ejecuta
+`manage.py flush --noinput`, luego `manage.py migrate` y vuelve a sembrar;
+los detalles están en [`backend/README.md`](backend/README.md).
+
 ### API REST
 
 El backend expone una API JSON versionada en `/api/v1/` y conserva el sitio HTML
@@ -108,9 +119,39 @@ curl -s -X POST http://localhost:5173/api/v1/auth/login/ \
 
 - Respuestas: `{"success": true, "data": ...}`; errores:
   `{"success": false, "error": {"code", "message", "details"}}`.
-- Autenticación: token de DRF o sesión de Django con `X-CSRFToken`.
+- Autenticación: token propio con vencimiento (`Authorization: Token <clave>`)
+  o sesión de Django con `X-CSRFToken`.
+- El login/registro devuelve `token` y `expires_at`; usa
+  `POST /api/v1/auth/token/refresh/` para rotar la clave y
+  `POST /api/v1/auth/logout-all/` para cerrar todas las sesiones.
 - Contrato completo: [`docs/api/API.md`](docs/api/API.md).
+- `GET /api/v1/carrito/` revalida precios y disponibilidad: sincroniza el
+  `precio_unitario` y devuelve `advertencias`. Si el catálogo cambia después,
+  `POST /api/v1/pagos/` responde `409` con `error.details.ajustes` hasta que el
+  cliente vuelva a consultar el carrito.
 - El frontend consulta `/api/v1/health/` para mostrar el estado de la API.
+
+El acceso por rol (RBAC) se rige por `Rol.codigo` (`administrador`,
+`gestor_inventario`, `soporte`, `cliente`), asignado con `UsuarioRol` o
+`usuario.roles.add(rol)`. `administrador`, `is_staff` e `is_superuser` pasan
+siempre; el catálogo es público en lectura y editable por administrador o
+`gestor_inventario`, el inventario y sus reportes permiten a esos dos roles,
+`soporte` gestiona los contactos y `cliente` solo lee los suyos. Una ruta
+protegida sin sesión responde `401 no_autenticado` y con sesión sin rol
+responde `403 permiso_denegado`. `gestor_inventario` y `soporte` los siembra la
+migración de datos `cuentas/0008_roles_rbac.py` y `seed_catalogo`; la matriz
+completa por método está en `docs/api/API.md` y su fuente única en
+`backend/api/rbac.py`.
+
+La administración de cuentas también está disponible por API para administradores:
+`POST /api/v1/usuarios/` crea usuarios con rol, `PUT`/`PATCH` edita datos, roles e
+`is_active`, y `POST /api/v1/usuarios/{id}/activar/|desactivar/` registra quién y
+cuándo cambia el estado. `/api/v1/roles/` ofrece un CRUD limitado: no se eliminan
+roles en uso. No se puede desactivar la propia cuenta, dejar sin administrador
+activo ni asignar roles superiores al propio; los conflictos responden `409` y
+los rechazos por permisos `403`, siempre con el sobre de error descrito arriba.
+Cada cambio queda en `AuditoriaCuenta` y puede consultarse en
+`GET /api/v1/usuarios/{id}/auditoria/` o en el admin de Django.
 
 ### Registrar PostgreSQL en pgAdmin
 
@@ -166,10 +207,23 @@ Toda la configuración está centralizada en el `.env` de la raíz. El Compose n
 |---|---|
 | Proyecto | `COMPOSE_PROJECT_NAME`, `IMAGE_TAG`, `TZ`, `RESTART_POLICY`, `PROD_RESTART_POLICY` |
 | Healthchecks | `HEALTHCHECK_INTERVAL`, `HEALTHCHECK_TIMEOUT`, `HEALTHCHECK_RETRIES`, `HEALTHCHECK_START_PERIOD`, `BACKEND_HEALTHCHECK_START_PERIOD`, `FRONTEND_HEALTHCHECK_START_PERIOD`, `PGADMIN_HEALTHCHECK_START_PERIOD` |
-| Backend | `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, `CORS_ALLOWED_ORIGINS`, `SECURE_SSL_REDIRECT`, `USE_X_FORWARDED_HOST`, `BACKEND_HOST`, `BACKEND_PORT`, `BACKEND_PUBLISHED_PORT`, `BACKEND_WORKERS`, `BACKEND_TIMEOUT`, `RUN_MIGRATIONS`, `COLLECTSTATIC`, `SEED_CATALOGO` |
+| Backend | `DJANGO_SECRET_KEY`, `DJANGO_DEBUG`, `DJANGO_ALLOWED_HOSTS`, `DJANGO_CSRF_TRUSTED_ORIGINS`, `CORS_ALLOWED_ORIGINS`, `API_TOKEN_TTL_DAYS`, `CARRITO_MAX_CANTIDAD_POR_LINEA`, `SECURE_SSL_REDIRECT`, `USE_X_FORWARDED_HOST`, `SECURE_REFERRER_POLICY`, `SESSION_COOKIE_SAMESITE`, `SECURE_HSTS_PRELOAD`, `LOG_LEVEL`, `BACKEND_HOST`, `BACKEND_PORT`, `BACKEND_PUBLISHED_PORT`, `BACKEND_WORKERS`, `BACKEND_TIMEOUT`, `RUN_MIGRATIONS`, `COLLECTSTATIC`, `SEED_CATALOGO` |
 | PostgreSQL | `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT`, `POSTGRES_PUBLISHED_PORT` |
 | pgAdmin | `PGADMIN_DEFAULT_EMAIL`, `PGADMIN_DEFAULT_PASSWORD`, `PGADMIN_PORT`, `PGADMIN_PUBLISHED_PORT`, `PGADMIN_MASTER_PASSWORD_REQUIRED` |
 | Frontend | `FRONTEND_PORT`, `FRONTEND_PUBLISHED_PORT`, `VITE_API_BASE_URL` |
+| Throttling / caché | `CACHE_TABLE`, `REDIS_URL`, `THROTTLE_NUM_PROXIES`, `THROTTLE_RATE_*`, `LOGIN_MAX_FAILED_ATTEMPTS`, `LOGIN_FAILURE_WINDOW_SECONDS`, `LOGIN_LOCKOUT_SECONDS` |
+
+Los contadores de la API usan una tabla de PostgreSQL (`django_cache`) creada
+automáticamente por el entrypoint con `createcachetable`; para usar Redis
+define `REDIS_URL` (requiere el paquete `redis`). Las respuestas `429` llevan
+cabecera `Retry-After`; el contrato está en [`docs/api/API.md`](docs/api/API.md).
+
+En producción los logs de la API son JSON en `stdout` (`LOG_LEVEL=INFO` por
+defecto) e incluyen `X-Request-ID`, método, ruta, estado, duración, IP y usuario.
+La clave se devuelve en cada respuesta y se registra también en los errores
+`500`. `backend/build.sh` ejecuta `python manage.py check --deploy` antes de
+desplegar y el workflow de CI `.github/workflows/backend.yml` ejecuta `pytest` y
+ese mismo check con `DEBUG=False` y una clave sintética válida.
 
 Los valores de `.env.example` son ficticios y solo ilustran el formato. En producción usa secretos reales gestionados fuera del repositorio.
 
@@ -272,14 +326,15 @@ El override de producción:
 
 - Ejecuta el backend con **Gunicorn** (workers y timeout configurables).
 - Sirve el frontend compilado con **Nginx oficial**; los procesos *worker* corren como usuario no privilegiado.
-- Fuerza `DEBUG=False` y mantiene `SECURE_SSL_REDIRECT=False` dentro del contenedor para que el healthcheck HTTP funcione detrás de un proxy TLS.
+- Fuerza `DEBUG=False`, mantiene activas las redirecciones HTTPS y confía en `X-Forwarded-Proto`; el healthcheck interno envía esa cabecera para no ser redirigido.
+- Usa `/api/v1/health/ready/` como healthcheck: verifica la base de datos y devuelve `503` si no responde.
 - Usa `restart: always`.
 
 Antes de usarlo:
 
 1. Define `DJANGO_DEBUG=False` y secretos fuertes en `.env`.
 2. Agrega tu dominio a `DJANGO_ALLOWED_HOSTS` y `DJANGO_CSRF_TRUSTED_ORIGINS`. Si el frontend consume la API sin el proxy `/api`, agrégalo también a `CORS_ALLOWED_ORIGINS`.
-3. Termina TLS en un proxy inverso externo (Nginx, Caddy, balanceador cloud).
+3. Termina TLS en un proxy inverso externo (Nginx, Caddy, balanceador cloud) y verifica que reenvíe `X-Forwarded-Proto: https`; es obligatorio con `SECURE_SSL_REDIRECT=True`.
 4. Para secretos de producción, usa **Docker secrets** (Swarm) o el gestor de secretos de tu plataforma; no los guardes en `.env` versionado ni en el repositorio.
 5. **Medios:** con `DEBUG=False` Django no sirve `/media/`. Configura S3/Supabase Storage (variables `AWS_*`) o sirve el volumen `backend_media` desde tu proxy inverso.
 6. **pgAdmin:** en producción se exige una *master password* adicional en el primer acceso.
@@ -344,6 +399,7 @@ Comprobado en un entorno limpio con Docker Compose:
 - `GET /` del backend responde `200`.
 - `GET /` del frontend responde `200`.
 - `GET /api/v1/health/` a través del frontend responde `200` (proxy interno hacia `backend` conservando `/api`).
+- `GET /api/v1/health/ready/` responde `200` con la BD disponible y `503` si se detiene `db`.
 - `GET /misc/ping` de pgAdmin responde `200` desde dentro del contenedor.
 - Conectividad backend → PostgreSQL verificada con `manage.py shell`.
 - Persistencia verificada: se creó un registro, se ejecutó `docker compose down` (sin `-v`), se volvió a levantar el stack y el registro seguía presente.

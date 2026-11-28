@@ -37,6 +37,9 @@ else:
     sys.exit("Database did not become ready in time.")
 PY
 
+echo "Preparing cache table..."
+python manage.py createcachetable
+
 if is_true "${RUN_MIGRATIONS:-true}"; then
   echo "Applying database migrations..."
   python manage.py migrate --noinput
@@ -47,7 +50,15 @@ if is_true "${COLLECTSTATIC:-true}"; then
   python manage.py collectstatic --noinput
 fi
 
-if is_true "${SEED_CATALOGO:-false}"; then
+catalogo_vacio() {
+  python manage.py shell -c \
+    "from catalogo.models import Videojuego; raise SystemExit(0 if Videojuego.objects.exists() else 1)" \
+    >/dev/null 2>&1
+}
+
+# Un contenedor recién creado tiene una base de datos sin juegos. Sembramos en
+# ese caso aunque SEED_CATALOGO=false para que la tienda nunca arranque vacía.
+if is_true "${SEED_CATALOGO:-false}" || ! catalogo_vacio; then
   echo "Seeding catalog..."
   python manage.py seed_catalogo
 fi

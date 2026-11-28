@@ -3,10 +3,9 @@ from rest_framework import mixins, status, viewsets
 from rest_framework.exceptions import NotFound, ValidationError
 from rest_framework.permissions import IsAuthenticated
 
-from pagos.models import Pago, Venta
+from pagos.models import IntentoPago, Venta
 from pagos.services import procesar_pago_simulado
-from pedidos.models import Pedido
-from pedidos.services import validar_para_checkout
+from pedidos.services import revalidar_carrito
 
 from ..exceptions import ErrorDeNegocio, respuesta_error, respuesta_exitosa
 from ..permissions import EsAdministrador
@@ -23,7 +22,7 @@ class PagoViewSet(
     permission_classes = [IsAuthenticated]
 
     def get_queryset(self):
-        queryset = Pago.objects.select_related("pedido", "pedido__cliente").order_by(
+        queryset = IntentoPago.objects.select_related("pedido", "pedido__cliente").order_by(
             "-creado_en", "-id"
         )
         if not es_administrador(self.request.user):
@@ -42,20 +41,29 @@ class PagoViewSet(
 
         if not es_administrador(request.user) and pedido.cliente_id != request.user.id:
             raise NotFound("El pedido no existe.")
-        if pedido.estado != Pedido.Estado.PENDIENTE:
+        if pedido.estado_id != "pendiente":
             raise ErrorDeNegocio("El pedido no está en estado pendiente.")
 
-        errores = validar_para_checkout(pedido)
-        if errores:
+        ajustes = revalidar_carrito(pedido, sincronizar=False)
+        if ajustes:
             raise ErrorDeNegocio(
-                "El pedido no está listo para pagar.",
-                extra={"errores": errores},
+                "El carrito cambió desde la última consulta. "
+                "Vuelve a GET /carrito/ para confirmar los ajustes antes de pagar.",
+                extra={
+                    "ajustes": ajustes,
+                    "errores": [ajuste["mensaje"] for ajuste in ajustes],
+                },
             )
 
         exito, mensaje = procesar_pago_simulado(pedido)
-        pago = Pago.objects.select_related("pedido", "pedido__cliente").filter(
-            pedido=pedido
-        ).first()
+        # Con varios intentos, el cliente ve siempre el último (el aprobado
+        # cuando el pago se completó; el rechazo si la pasarela lo denegó).
+        pago = (
+            IntentoPago.objects.select_related("pedido", "pedido__cliente")
+            .filter(pedido=pedido)
+            .order_by("-creado_en", "-pk")
+            .first()
+        )
 
         if pago is None:
             # La operación se bloqueó antes de registrar el intento de pago.
@@ -87,6 +95,7 @@ class VentaViewSet(viewsets.ReadOnlyModelViewSet):
             .prefetch_related(
                 "pedido__detalles__oferta__videojuego",
                 "pedido__detalles__oferta__plataforma",
+                "pedido__detalles__oferta__estado_publicacion",
             )
             .order_by("-registrada_en", "-id")
         )

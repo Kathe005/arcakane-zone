@@ -1,31 +1,51 @@
 import { Link, useParams } from "react-router-dom";
+import { LoadingFallback } from "../../../app/LoadingFallback";
+import { NotFoundPage } from "../../../app/NotFoundPage";
 import { routes } from "../../../app/routes";
 import { ArrowLeftIcon } from "../../../components/icons";
 import { Badge } from "../../../components/ui/Badge";
 import { ButtonLink } from "../../../components/ui/Button";
+import { EmptyState } from "../../../components/ui/EmptyState";
 import { formatPrice } from "../../../lib/format";
-import { NotFoundPage } from "../../../app/NotFoundPage";
 import {
-  getProductById,
   getPublishedOffers,
   getRelatedProducts,
   getStartingPrice,
   isProductAvailable,
 } from "../catalog";
+import { alFallarPortada } from "../cover";
+import { useCatalogProduct, useCatalogProducts } from "../api";
 import { ProductGrid } from "../components/ProductGrid";
 import { ProductOffers } from "../components/ProductOffers";
 import { ProductSpecs } from "../components/ProductSpecs";
 
 export function ProductDetailPage() {
   const { productId } = useParams();
-  const product = productId ? getProductById(productId) : undefined;
+  const producto = useCatalogProduct(productId);
+  const catalogo = useCatalogProducts();
 
+  if (producto.isPending || catalogo.isPending) {
+    return <LoadingFallback />;
+  }
+
+  if (producto.isError || catalogo.isError) {
+    return (
+      <div className="mx-auto w-full max-w-3xl px-4 py-16 sm:px-6">
+        <EmptyState
+          title="No se pudo cargar el videojuego"
+          description="Inténtalo de nuevo en unos instantes. Los datos se leen desde la API."
+        />
+      </div>
+    );
+  }
+
+  const product = producto.data;
   if (!product) {
     return <NotFoundPage />;
   }
 
   const startingPrice = getStartingPrice(product);
-  const relatedProducts = getRelatedProducts(product);
+  const relatedProducts = getRelatedProducts(product, catalogo.data ?? []);
   const previewImages = [product.cover, ...product.gallery];
 
   return (
@@ -56,6 +76,7 @@ export function ProductDetailPage() {
             <img
               src={product.cover}
               alt={`Portada de ${product.title}`}
+              onError={alFallarPortada}
               className="aspect-[4/5] w-full object-cover"
             />
             <figcaption className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-ink-950 via-ink-950/70 to-transparent p-6 pt-20 text-lg font-bold text-white">
@@ -75,6 +96,7 @@ export function ProductDetailPage() {
                   }
                   className="aspect-video w-full object-cover"
                   loading="lazy"
+                  onError={alFallarPortada}
                 />
               </li>
             ))}
@@ -83,7 +105,6 @@ export function ProductDetailPage() {
 
         <div>
           <div className="flex flex-wrap gap-2">
-            {product.featured ? <Badge tone="brand">Destacado</Badge> : null}
             <Badge tone="aqua">{product.category.name}</Badge>
             <Badge tone={isProductAvailable(product) ? "success" : "warning"}>
               {isProductAvailable(product) ? "Disponible" : "Agotado"}

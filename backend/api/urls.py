@@ -13,11 +13,13 @@ from .views.auth import (
     CambioPasswordView,
     CsrfView,
     LoginView,
+    LogoutAllView,
     LogoutView,
     MeView,
     RegistroView,
+    TokenRefreshView,
 )
-from .views.base import ApiNotFoundView, ApiRootView, HealthView
+from .views.base import ApiNotFoundView, ApiRootView, HealthReadyView, HealthView
 from .views.carrito import CarritoItemDetalleView, CarritoItemsView, CarritoView
 from .views.catalogo import (
     CategoriaViewSet,
@@ -26,6 +28,7 @@ from .views.catalogo import (
     PlataformaViewSet,
     VideojuegoViewSet,
 )
+from .views.inventario import AjusteInventarioView, MovimientoInventarioViewSet
 from .views.pagos import PagoViewSet, VentaViewSet
 from .views.pedidos import PedidoViewSet
 from .views.reportes import (
@@ -43,6 +46,11 @@ router.register("catalogo/plataformas", PlataformaViewSet, basename="plataforma"
 router.register("catalogo/generos", GeneroViewSet, basename="genero")
 router.register("catalogo/videojuegos", VideojuegoViewSet, basename="videojuego")
 router.register("catalogo/ofertas", OfertaVideojuegoViewSet, basename="oferta")
+router.register(
+    "inventario/movimientos",
+    MovimientoInventarioViewSet,
+    basename="movimiento-inventario",
+)
 router.register("pedidos", PedidoViewSet, basename="pedido")
 router.register("pagos", PagoViewSet, basename="pago")
 router.register("ventas", VentaViewSet, basename="venta")
@@ -53,10 +61,13 @@ router.register("roles", RolViewSet, basename="rol")
 urlpatterns = [
     path("", ApiRootView.as_view(), name="api-root"),
     path("health/", HealthView.as_view(), name="api-health"),
+    path("health/ready/", HealthReadyView.as_view(), name="api-health-ready"),
     # Autenticación y perfil
     path("auth/registro/", RegistroView.as_view(), name="auth-registro"),
     path("auth/login/", LoginView.as_view(), name="auth-login"),
     path("auth/logout/", LogoutView.as_view(), name="auth-logout"),
+    path("auth/token/refresh/", TokenRefreshView.as_view(), name="auth-token-refresh"),
+    path("auth/logout-all/", LogoutAllView.as_view(), name="auth-logout-all"),
     path("auth/me/", MeView.as_view(), name="auth-me"),
     path(
         "auth/me/password/",
@@ -71,6 +82,12 @@ urlpatterns = [
         "carrito/items/<int:pk>/",
         CarritoItemDetalleView.as_view(),
         name="carrito-item-detalle",
+    ),
+    # Inventario (solo administración)
+    path(
+        "inventario/ajustes/",
+        AjusteInventarioView.as_view(),
+        name="inventario-ajuste",
     ),
     # Reportes (solo staff)
     path("reportes/dashboard/", DashboardView.as_view(), name="reporte-dashboard"),
